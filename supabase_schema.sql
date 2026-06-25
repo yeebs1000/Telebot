@@ -13,7 +13,10 @@ create table if not exists group_chat_logs (
 );
 
 -- Vector embeddings of group messages, used for semantic memory search.
--- text-embedding-004 produces 768-dimensional vectors.
+-- Gemini's text-embedding-004 natively produces 768-dim vectors; the OpenAI
+-- provider requests 768 dims via the `dimensions` param to match. This table
+-- stays empty (and the feature is skipped) while AI_PROVIDER=claude, since
+-- Anthropic has no embeddings API.
 create table if not exists group_embeddings (
     id          bigint generated always as identity primary key,
     chat_id     bigint not null,

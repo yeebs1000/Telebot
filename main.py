@@ -1,25 +1,9 @@
 """
-Intelligent Telegram Group Assistant — main.py
-===============================================
-FIXES IN THIS VERSION vs PREVIOUS:
-  1. [CRITICAL] Broken Apple NTP URL (was a markdown link literal) — extracted
-     into get_network_time() helper used everywhere, no duplication.
-  2. [CRITICAL] classify_intent() routing prompt completely rewritten with
-     explicit few-shot examples so the lite model reliably hits WEB_SEARCH
-     for live scores / news AND correctly maps company names → tickers.
-  3. [CRITICAL] All httpx calls converted to AsyncClient (non-blocking).
-  4. [CRITICAL] All Supabase + sync GenAI calls wrapped in asyncio.to_thread()
-     so the event loop is never blocked under concurrent group messages.
-  5. [BUG] Bot shutdown loop replaced with asyncio.Event().wait() + clean drain.
-  6. [BUG] Removed unused `import numpy as np`.
-  7. [BUG] Unreachable return at the bottom of fetch_live_financial_data removed.
-  8. [IMPROVEMENT] Tavily `include_answer=True` — returns a direct synthesised
-     answer which is critical for sports scores & breaking news.
-  9. [IMPROVEMENT] Alpha Vantage rate-limit Note/Information fields are now
-     detected and surfaced rather than silently returning an empty quote.
- 10. [IMPROVEMENT] `drop_pending_updates=True` on start_polling — prevents the
-     bot from replaying stale messages after a Railway container restart.
- 11. [IMPROVEMENT] MODEL constant at the top — change once, applies everywhere.
+AI-Powered Telebot — main.py
+=============================
+An intelligent Telegram group assistant that works with any of several AI
+providers (Gemini, OpenAI, Claude) — pick yours with the AI_PROVIDER env var.
+See providers/ for the adapter interface and README.md for setup.
 """
 
 import os
@@ -36,11 +20,10 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
 )
-from google import genai
-from google.genai import types
-from google.genai.errors import APIError
 from supabase import create_client, Client
 from dotenv import load_dotenv
+
+from providers import get_provider
 
 # ── LOGGING ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -54,26 +37,21 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 SUPABASE_URL       = os.getenv("SUPABASE_URL")
 SUPABASE_KEY       = os.getenv("SUPABASE_KEY")
-GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TAVILY_API_KEY     = os.getenv("TAVILY_API_KEY")
 ALPHA_VANTAGE_KEY  = os.getenv("ALPHA_VANTAGE_KEY")
+AI_PROVIDER_NAME   = os.getenv("AI_PROVIDER", "gemini")
 
-if not all([GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY]):
+if not all([TELEGRAM_BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY]):
     logger.critical("MISSING CORE ENV VARS — check your .env / Railway config.")
 
 # ── CLIENT INIT ───────────────────────────────────────────────────────────────
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
-genai_client = genai.Client(api_key=GEMINI_API_KEY)
+ai_provider = get_provider(AI_PROVIDER_NAME)
+logger.info(f"AI provider: {ai_provider.name} (embeddings supported: {ai_provider.supports_embeddings})")
 
 # In-memory session store (wiped on container restart — acceptable for group chat)
 chat_sessions: dict = {}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# UPDATE THIS if you have access to a newer or different model tier.
-# The same model is used for chat sessions AND routing classification.
-# ─────────────────────────────────────────────────────────────────────────────
-MODEL = "gemini-3.1-flash-lite"
 
 
 # ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
@@ -90,14 +68,8 @@ def get_system_prompt() -> str:
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def get_network_time() -> datetime:
-    """
-    FIX #1 — The original code had a markdown link baked into the URL string:
-        time_client.head("[https://www.apple.com](https://www.apple.com)", ...)
-    That silently fails every single call, so NTP sync was never actually running.
-
-    This function fetches real atomic time from Apple's HTTP Date header and is
-    used everywhere a timestamp is needed, eliminating all duplication.
-    """
+    """Fetches real atomic time from Apple's HTTP Date header (falls back to
+    the system clock on failure) — used everywhere a timestamp is needed."""
     try:
         async with httpx.AsyncClient() as c:
             res = await c.head("https://www.apple.com", timeout=2.0)
@@ -110,11 +82,8 @@ async def get_network_time() -> datetime:
 
 
 async def search_the_live_web(query: str) -> str:
-    """
-    FIX #3 + IMPROVEMENT #8 — Now uses AsyncClient (non-blocking) and sets
-    include_answer=True so Tavily returns a direct synthesised answer, which
-    is essential for sports scores and live event results.
-    """
+    """Tavily web search with include_answer=True for a direct synthesised
+    answer — essential for sports scores and live event results."""
     if not TAVILY_API_KEY:
         return "Tavily API key not configured."
     try:
@@ -125,7 +94,7 @@ async def search_the_live_web(query: str) -> str:
                     "api_key": TAVILY_API_KEY,
                     "query": query,
                     "search_depth": "basic",
-                    "include_answer": True,   # ← direct answer for scores, weather, etc.
+                    "include_answer": True,
                     "max_results": 5,
                 },
                 timeout=8.0,
@@ -151,12 +120,8 @@ async def search_the_live_web(query: str) -> str:
 
 
 async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
-    """
-    FIX #3 — Now uses AsyncClient throughout (non-blocking).
-    IMPROVEMENT #9 — Alpha Vantage rate-limit notes are detected and returned
-    as a readable message instead of silently returning an empty quote.
-    FIX #7 — Unreachable bare `return` at the end of the original removed.
-    """
+    """Stock/forex/commodity quotes via Alpha Vantage. Rate-limit notes are
+    surfaced as readable messages instead of silently returning empty data."""
     if not ALPHA_VANTAGE_KEY:
         return "Alpha Vantage API key not configured."
 
@@ -176,7 +141,6 @@ async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
                 quote = data.get("Global Quote", {})
 
                 if not quote or not quote.get("05. price"):
-                    # Surface rate-limit messages instead of swallowing them
                     note = data.get("Note") or data.get("Information", "")
                     if note:
                         return f"Alpha Vantage rate limit hit: {note}"
@@ -241,19 +205,9 @@ async def fetch_live_financial_data(asset_type: str, symbol: str) -> str:
 
 
 async def classify_intent(user_text: str) -> dict:
-    """
-    FIX #2 — THE MAIN ROUTING FIX.
-
-    The original prompt was too vague. A lite model without concrete examples
-    defaulted everything to REGULAR_CHAT, which is why sports scores and stock
-    queries were never being routed. This rewrite uses explicit few-shot examples
-    for every category, forcing reliable classification even from a small model.
-
-    Key additions:
-      - Company name → ticker mapping examples (lululemon → LULU)
-      - Explicit rule: ANY live score / match result MUST be WEB_SEARCH
-      - Explicit rule: ANY current news MUST be WEB_SEARCH
-    """
+    """Routes a message to STOCK/FOREX/COMMODITY/WEB_SEARCH/REGULAR_CHAT via
+    a strict JSON classification prompt, using whichever AI provider is
+    configured. Few-shot examples keep small/lite models reliable."""
     routing_prompt = f"""You are a strict JSON intent classifier for a Telegram assistant bot.
 
 Read the user message and return EXACTLY ONE JSON object from the options below.
@@ -334,14 +288,7 @@ User message: "{user_text}"
 """
 
     try:
-        response = await asyncio.to_thread(
-            lambda: genai_client.models.generate_content(
-                model=MODEL,
-                contents=routing_prompt,
-                config={"response_mime_type": "application/json"},
-            )
-        )
-        route = json.loads(response.text.strip())
+        route = await ai_provider.generate_json(routing_prompt)
         logger.info(f"[ROUTER] '{user_text}' → {route}")
         return route
     except Exception as e:
@@ -364,11 +311,8 @@ async def execute_dynamic_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def expire_poll_job(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Fires when a poll window closes. Tallies votes, determines winner,
-    edits the original message, then deletes the DB record.
-    FIX #4 — Supabase calls wrapped in asyncio.to_thread.
-    """
+    """Fires when a poll window closes. Tallies votes, determines winner,
+    edits the original message, then deletes the DB record."""
     d = context.job.data
     poll_id, chat_id, message_id = d["poll_id"], d["chat_id"], d["message_id"]
     try:
@@ -463,10 +407,7 @@ async def handle_poll_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Core handler — logs context, routes intent, and delivers a response.
-    All blocking I/O is now wrapped in asyncio.to_thread() (FIX #4).
-    """
+    """Core handler — logs context, routes intent, and delivers a response."""
     if not update.effective_chat or not update.message:
         return
 
@@ -500,18 +441,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     {"chat_id": chat_id, "sender": user_name, "message": user_text}
                 ).execute()
             )
-            embed = await asyncio.to_thread(
-                lambda: genai_client.models.embed_content(
-                    model="text-embedding-004",
-                    contents=f"{user_name}: {user_text}",
+            # Semantic memory requires an embedding-capable provider (Gemini/OpenAI).
+            # Claude has no embeddings API, so this step is skipped automatically.
+            if ai_provider.supports_embeddings:
+                vec = await ai_provider.embed(f"{user_name}: {user_text}")
+                await asyncio.to_thread(
+                    lambda: supabase_client.table("group_embeddings").insert(
+                        {"chat_id": chat_id, "sender": user_name, "message": user_text, "embedding": vec}
+                    ).execute()
                 )
-            )
-            vec = embed.embeddings[0].values
-            await asyncio.to_thread(
-                lambda: supabase_client.table("group_embeddings").insert(
-                    {"chat_id": chat_id, "sender": user_name, "message": user_text, "embedding": vec}
-                ).execute()
-            )
         except Exception as e:
             logger.error(f"Background log/embed error: {e}")
 
@@ -520,13 +458,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── SESSION INIT ──────────────────────────────────────────────────────────
     if chat_id not in chat_sessions:
-        chat_sessions[chat_id] = genai_client.chats.create(
-            model=MODEL,
-            config=types.GenerateContentConfig(
-                system_instruction=get_system_prompt(),
-                temperature=0.7,
-            ),
-        )
+        chat_sessions[chat_id] = ai_provider.create_chat(get_system_prompt())
 
     chat         = chat_sessions[chat_id]
     cleaned_text = user_text.replace(bot_username, "").strip().lower()
@@ -599,10 +531,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         try:
-            raw = await asyncio.to_thread(
-                lambda: genai_client.models.generate_content(model=MODEL, contents=parse_prompt)
-            )
-            clean  = raw.text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            raw    = await ai_provider.generate_text(parse_prompt)
+            clean  = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
             parsed = json.loads(clean)
 
             sg_tz  = pytz.timezone("Asia/Singapore")
@@ -636,32 +566,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # FEATURE 4 — SEMANTIC LONG-TERM MEMORY SEARCH
     # ══════════════════════════════════════════════════════════════════════════
     elif any(k in cleaned_text for k in ["where did we", "what was that", "search memory"]) and not image_bytes:
-        try:
-            embed = await asyncio.to_thread(
-                lambda: genai_client.models.embed_content(model="text-embedding-004", contents=user_text)
+        if not ai_provider.supports_embeddings:
+            prompt_payload = (
+                f"Tell the user semantic memory search isn't available because the "
+                f"current AI provider ('{ai_provider.name}') doesn't support embeddings — "
+                f"suggest they switch AI_PROVIDER to gemini or openai for this feature, "
+                f"or try asking for a 'summary' instead."
             )
-            vec = embed.embeddings[0].values
+        else:
+            try:
+                vec = await ai_provider.embed(user_text)
 
-            db_res = await asyncio.to_thread(
-                lambda: supabase_client.rpc("match_chat_embeddings", {
-                    "query_embedding": vec,
-                    "match_threshold": 0.3,
-                    "match_count": 5,
-                    "filter_chat_id": chat_id,
-                }).execute()
-            )
-            matches = db_res.data or []
-            if matches:
-                mem = "\n".join(f"- {m['sender']}: {m['message']}" for m in matches)
-                prompt_payload = (
-                    f"Semantic memory search results:\n{mem}\n\n"
-                    f"Answer the user's question concisely based on these records."
+                db_res = await asyncio.to_thread(
+                    lambda: supabase_client.rpc("match_chat_embeddings", {
+                        "query_embedding": vec,
+                        "match_threshold": 0.3,
+                        "match_count": 5,
+                        "filter_chat_id": chat_id,
+                    }).execute()
                 )
-            else:
-                prompt_payload = "Tell user nothing matched in the vector memory index for that topic."
-        except Exception as e:
-            logger.error(f"Vector search error: {e}")
-            prompt_payload = "Tell user the semantic search pipeline failed."
+                matches = db_res.data or []
+                if matches:
+                    mem = "\n".join(f"- {m['sender']}: {m['message']}" for m in matches)
+                    prompt_payload = (
+                        f"Semantic memory search results:\n{mem}\n\n"
+                        f"Answer the user's question concisely based on these records."
+                    )
+                else:
+                    prompt_payload = "Tell user nothing matched in the vector memory index for that topic."
+            except Exception as e:
+                logger.error(f"Vector search error: {e}")
+                prompt_payload = "Tell user the semantic search pipeline failed."
 
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 5 — INTERACTIVE LIVE POLLS
@@ -717,9 +652,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ══════════════════════════════════════════════════════════════════════════
     # FEATURE 6 & 7 — DYNAMIC INTENT ROUTING (Financial Data + Web Search)
-    # The classify_intent() prompt rewrite is the core fix for the screenshot
-    # failures: sports scores now reliably hit WEB_SEARCH, and company names
-    # now correctly resolve to ticker symbols for STOCK routing.
     # ══════════════════════════════════════════════════════════════════════════
     else:
         route       = await classify_intent(user_text)
@@ -755,17 +687,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live_dt   = await get_network_time()
     ts_string = live_dt.strftime("%A, %d %B %Y, %I:%M %p SGT")
 
-    # ── ASSEMBLE MULTIMODAL PAYLOAD ───────────────────────────────────────────
-    contents = []
-    if image_bytes:
-        contents.append(types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"))
-    contents.append(f"[Live Time: {ts_string}]\nUser: {prompt_payload or 'Analyze this image.'}")
+    # ── ASSEMBLE PAYLOAD ───────────────────────────────────────────────────────
+    message_text = f"[Live Time: {ts_string}]\nUser: {prompt_payload or 'Analyze this image.'}"
+    image_arg = (image_bytes, "image/jpeg") if image_bytes else None
 
-    # ── SEND TO GEMINI — RETRY ON RATE LIMIT / OVERLOAD ───────────────────────
+    # ── SEND TO THE AI PROVIDER — RETRY ON TRANSIENT FAILURE ──────────────────
     for attempt in range(3):
         try:
-            response     = await asyncio.to_thread(lambda: chat.send_message(contents))
-            bot_response = response.text.strip()
+            bot_response = await chat.send(message_text, image=image_arg)
 
             is_image_url = bot_response.startswith(("http://", "https://")) and any(
                 bot_response.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif")
@@ -777,18 +706,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.send_message(chat_id=chat_id, text=bot_response)
             return
 
-        except APIError as e:
-            if e.code in [429, 503] and attempt < 2:
+        except Exception as e:
+            logger.error(f"AI provider response error (attempt {attempt + 1}): {e}")
+            if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
                 continue
             await context.bot.send_message(
-                chat_id=chat_id, text="AI servers are swamped. Give it a sec and try again!"
+                chat_id=chat_id, text="AI servers are swamped or something went sideways. Try again?"
             )
-            return
-        except Exception as e:
-            logger.error(f"Gemini response error (attempt {attempt + 1}): {e}")
-            if attempt == 2:
-                await context.bot.send_message(chat_id=chat_id, text="Something went sideways. Try again?")
             return
 
 
@@ -821,10 +746,9 @@ async def main():
 
     async with app:
         await app.start()
-        # FIX #10 — drop_pending_updates prevents replaying stale messages on Railway restart
+        # drop_pending_updates prevents the bot from replaying stale messages
+        # after a container restart (e.g. on Railway).
         await app.updater.start_polling(drop_pending_updates=True)
-        # FIX #5 — clean block instead of while True: sleep(3600)
-        # asyncio.Event().wait() exits cleanly on KeyboardInterrupt / SIGTERM
         await asyncio.Event().wait()
         await app.updater.stop()
         await app.stop()

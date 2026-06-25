@@ -5,11 +5,24 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- Renamed the project to **AI-Powered Telebot** to reflect multi-provider
+  support.
+- `providers/` — a small adapter layer (`AIProvider` / `ChatSession` in
+  `providers/base.py`) so the bot can run on Gemini, OpenAI, or Claude via
+  a single `AI_PROVIDER` env var, with an optional `AI_MODEL` override.
+  Embeddings-dependent features (background message embedding, semantic
+  memory search) are automatically skipped when the active provider doesn't
+  support embeddings (currently Claude).
 - README with full setup/deploy instructions, `.env.example`, LICENSE (MIT),
   CONTRIBUTING.md, and a minimal CI workflow for open-sourcing.
 - `supabase_schema.sql` — documents the tables (`group_chat_logs`,
   `group_embeddings`, `active_polls`) and the `match_chat_embeddings` RPC
   function the bot depends on, previously undocumented.
+- CONTRIBUTING.md section on adding a new AI provider.
+
+### Changed
+- `main.py` no longer imports any AI vendor SDK directly — all model calls
+  go through `providers.get_provider()`.
 
 ### Fixed
 - `requirements.txt` was corrupted (UTF-16 encoded with embedded nulls),
